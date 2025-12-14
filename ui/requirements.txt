@@ -4,3 +4,8 @@ numpy
 scipy
 requests
 faster-whisper
+compressed_tensors
+torch==2.9.0
+torchaudio==2.9.0
+torchcodec
+boson-multimodal==0.1.1
