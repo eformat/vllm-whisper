@@ -1,5 +1,5 @@
 import streamlit as st
-import sounddevice as sd
+import torch
 import numpy as np
 from faster_whisper import WhisperModel
 from scipy.signal import resample_poly
@@ -7,6 +7,12 @@ import queue
 import threading
 import time
 from pathlib import Path
+import io
+
+try:
+    import sounddevice as sd  # type: ignore
+except Exception:  # pragma: no cover
+    sd = None  # allows running in browser-only/container deployments without PortAudio
 
 # Audio configuration
 SAMPLE_RATE = 16000
@@ -64,10 +70,13 @@ class RealTimeState:
         self.source: str | None = None  # "mic" or "wav"
         self.mic_device_index: int | None = None
         self.mic_device_name: str | None = None
+        self.capture_sample_rate: int | None = None  # actual input stream sample rate (mic)
 
 
 def list_input_devices():
     """Return a list of (device_index, display_name) for input-capable devices."""
+    if sd is None:
+        return []
     devices = sd.query_devices()
     out = []
     for idx, d in enumerate(devices):
@@ -91,13 +100,17 @@ def get_rt_state_and_model() -> tuple[RealTimeState, WhisperModel]:
     if "whisper_model" not in st.session_state:
         # Load the local Whisper model once and reuse it
         # Use "cuda" for device if you have a GPU available.
-        st.session_state.whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
+        st.session_state.whisper_model = WhisperModel("base.en", device="cuda" if torch.cuda.is_available() else "cpu", compute_type="int8")
 
     return st.session_state.rt_state, st.session_state.whisper_model
 
 
 def audio_stream_worker(rt_state: RealTimeState, device_index: int | None) -> None:
     """Background worker that maintains a live input audio stream."""
+    if sd is None:
+        rt_state.last_error = "sounddevice is not available in this environment (no server-side mic)."
+        rt_state.running_event.clear()
+        return
 
     def _callback(indata, frames, time_info, status):
         """This is called (from a separate thread) for each audio block."""
@@ -118,14 +131,41 @@ def audio_stream_worker(rt_state: RealTimeState, device_index: int | None) -> No
             except Exception:
                 rt_state.mic_device_name = None
 
-        with sd.InputStream(
-            callback=_callback,
-            dtype=DTYPE,
-            channels=CHANNELS,
-            samplerate=SAMPLE_RATE,
-            blocksize=BLOCK_SIZE,
-            device=device_index,
-        ):
+        # Some devices/drivers reject 16kHz capture. Try 16k first, then fall back to the
+        # device's default sample rate and resample to 16k before Whisper.
+        def _open_stream(sr: int):
+            blocksize = int(sr * CHUNK_DURATION)
+            return sd.InputStream(
+                callback=_callback,
+                dtype=DTYPE,
+                channels=CHANNELS,
+                samplerate=sr,
+                blocksize=blocksize,
+                device=device_index,
+            )
+
+        try:
+            rt_state.capture_sample_rate = SAMPLE_RATE
+            stream = _open_stream(SAMPLE_RATE)
+        except Exception as e_16k:
+            # Determine device default sample rate
+            default_sr = None
+            try:
+                dev_idx = rt_state.mic_device_index
+                if dev_idx is not None:
+                    default_sr = sd.query_devices(dev_idx).get("default_samplerate")
+            except Exception:
+                default_sr = None
+
+            fallback_sr = int(default_sr) if default_sr else 48000
+            rt_state.capture_sample_rate = fallback_sr
+            rt_state.last_error = (
+                f"16kHz capture unsupported ({type(e_16k).__name__}: {e_16k}); "
+                f"falling back to {fallback_sr}Hz and resampling to 16k."
+            )
+            stream = _open_stream(fallback_sr)
+
+        with stream:
             # Keep the stream alive while running flag is set
             while rt_state.running_event.is_set():
                 sd.sleep(100)
@@ -141,6 +181,11 @@ def transcriber_worker(rt_state: RealTimeState, model: WhisperModel) -> None:
 
     print("Transcriber started. Listening for audio chunks...")
 
+    # Mic capture may not be 16k; we resample to SAMPLE_RATE for Whisper.
+    capture_sr = int(rt_state.capture_sample_rate or SAMPLE_RATE)
+    bytes_per_sample = np.dtype(DTYPE).itemsize
+    target_bytes = int(capture_sr * CHUNK_DURATION) * bytes_per_sample * CHANNELS
+
     # Keep going while running, and drain any already-queued audio after stop.
     while rt_state.running_event.is_set() or not rt_state.audio_queue.empty():
         try:
@@ -151,10 +196,12 @@ def transcriber_worker(rt_state: RealTimeState, model: WhisperModel) -> None:
         full_audio_buffer += data
 
         # Process when buffer reaches desired size
-        if len(full_audio_buffer) >= BLOCK_SIZE * 2:  # int16 => 2 bytes per sample
+        if len(full_audio_buffer) >= target_bytes:
             try:
                 # Convert bytes to float32 numpy array in range [-1.0, 1.0]
                 audio_np = np.frombuffer(full_audio_buffer, dtype=DTYPE).astype(np.float32) / 32768.0
+                if capture_sr != SAMPLE_RATE:
+                    audio_np = resample_to_sample_rate(audio_np, capture_sr, SAMPLE_RATE).astype(np.float32)
 
                 # Transcribe the chunk using the local Whisper model
                 segments, info = model.transcribe(audio_np, beam_size=5)
@@ -184,6 +231,9 @@ def transcriber_worker(rt_state: RealTimeState, model: WhisperModel) -> None:
 
 def start_realtime_transcription(rt_state: RealTimeState, model: WhisperModel, device_index: int | None) -> None:
     """Start microphone capture and transcription if not already running."""
+    if sd is None:
+        rt_state.last_error = "sounddevice is not available in this environment (no server-side mic)."
+        return
     if rt_state.running_event.is_set():
         return
 
@@ -319,6 +369,34 @@ def stop_realtime_transcription(rt_state: RealTimeState) -> None:
         rt_state.transcriber_thread.join(timeout=5.0)
 
 
+def _decode_wav_bytes_to_mono_float32_16k(wav_bytes: bytes) -> np.ndarray:
+    """
+    Decode WAV bytes -> mono float32 array in [-1, 1] at SAMPLE_RATE.
+    Uses scipy.io.wavfile, which supports WAV containers.
+    """
+    import scipy.io.wavfile as wavfile
+
+    sr, audio = wavfile.read(io.BytesIO(wav_bytes))
+
+    if sr != SAMPLE_RATE:
+        audio = resample_to_sample_rate(audio, sr, SAMPLE_RATE)
+
+    # Convert to mono if needed
+    if len(audio.shape) > 1:
+        audio = np.mean(audio, axis=1)
+
+    # Normalize to float32 [-1, 1]
+    if np.issubdtype(audio.dtype, np.integer):
+        # assume int16-like PCM
+        denom = float(np.iinfo(audio.dtype).max)
+        audio_np = audio.astype(np.float32) / denom
+    else:
+        audio_np = audio.astype(np.float32)
+        audio_np = np.clip(audio_np, -1.0, 1.0)
+
+    return audio_np
+
+
 def main():
     rt_state, model = get_rt_state_and_model()
 
@@ -331,6 +409,13 @@ def main():
     @st.fragment(run_every=0.5)
     def _controls_panel():
         st.subheader("Microphone")
+
+        if sd is None:
+            st.warning(
+                "Server-side microphone capture is unavailable here (sounddevice/PortAudio missing). "
+                "Use **Browser Recorder** below instead."
+            )
+            return
 
         default_in = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else None
         default_name = None
@@ -374,6 +459,36 @@ def main():
 
     _controls_panel()
 
+    def _browser_audio_panel():
+        st.markdown("---")
+        st.subheader("Browser Recorder (st.audio_input)")
+
+        audio_value = st.audio_input("Record a voice message", key="browser_audio_input")
+
+        if audio_value:
+            st.success("Audio recorded successfully!")
+            st.audio(audio_value)
+
+            if st.button("Transcribe recording (one-shot)", key="btn_transcribe_browser_audio"):
+                try:
+                    data = audio_value.getvalue() if hasattr(audio_value, "getvalue") else audio_value.read()
+                    audio_np = _decode_wav_bytes_to_mono_float32_16k(data)
+                    segs, info = model.transcribe(audio_np, beam_size=5)
+                    seg_list = list(segs)
+                    text = "".join(seg.text.strip() + " " for seg in seg_list)
+                    with rt_state.transcript_lock:
+                        rt_state.transcript = text
+                    rt_state.segment_count = len(seg_list)
+                    rt_state.last_update_ts = time.time()
+                    rt_state.last_error = None
+                    rt_state.source = "browser_audio"
+                    st.success("Browser recording transcription complete. See Live Transcript below.")
+                except Exception as e:
+                    rt_state.last_error = f"{type(e).__name__}: {e}"
+                    st.error(f"Failed to transcribe browser recording: {rt_state.last_error}")
+
+    _browser_audio_panel()
+
     @st.fragment(run_every=0.5)
     def _wav_panel():
         st.markdown("---")
@@ -401,30 +516,22 @@ def main():
         c1, c2 = st.columns(2)
         with c1:
             if st.button("Transcribe WAV (one-shot)", key="btn_transcribe_wav"):
-                import scipy.io.wavfile as wavfile
-                import io
-
                 if uploaded is None and selected_path is None:
                     st.error("Please upload a WAV file or choose the bundled sample.")
                 else:
                     if selected_path is not None:
-                        sr, audio = wavfile.read(str(selected_path))
+                        with open(selected_path, "rb") as f:
+                            data = f.read()
                     else:
                         data = uploaded.read()
-                        sr, audio = wavfile.read(io.BytesIO(data))
 
-                    if sr != SAMPLE_RATE:
-                        audio = resample_to_sample_rate(audio, sr, SAMPLE_RATE)
-
-                    if len(audio.shape) > 1:
-                        audio = np.mean(audio, axis=1).astype(audio.dtype)
-
-                    audio_np = audio.astype(np.float32) / 32768.0
-                    segments, info = model.transcribe(audio_np, beam_size=5)
-                    text = "".join(seg.text.strip() + " " for seg in segments)
+                    audio_np = _decode_wav_bytes_to_mono_float32_16k(data)
+                    segs, info = model.transcribe(audio_np, beam_size=5)
+                    seg_list = list(segs)
+                    text = "".join(seg.text.strip() + " " for seg in seg_list)
                     with rt_state.transcript_lock:
                         rt_state.transcript = text
-                    rt_state.segment_count = len(list(segments))
+                    rt_state.segment_count = len(seg_list)
                     rt_state.last_update_ts = time.time()
                     rt_state.last_error = None
                     rt_state.source = "wav"

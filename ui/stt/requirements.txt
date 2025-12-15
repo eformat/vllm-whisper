@@ -4,3 +4,4 @@ numpy
 scipy
 requests
 faster-whisper
+torch

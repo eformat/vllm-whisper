@@ -1,0 +1,14 @@
+# oc get is -n redhat-ods-applications minimal-gpu -o yaml | grep -C3 2025.2
+FROM registry.redhat.io/rhoai/odh-workbench-jupyter-minimal-cuda-py312-rhel9@sha256:b6d4db66af4f575a3bd435fbe7661659db23429293ce5b7149c5fa920c33cf85
+USER root
+ARG RHEL_RHSM_USERNAME
+ARG RHEL_RHSM_PASSWORD
+# install portaudio from EPEL
+RUN subscription-manager register --username "${RHEL_RHSM_USERNAME}" --password "${RHEL_RHSM_PASSWORD}" --auto-attach && \
+    subscription-manager repos --enable codeready-builder-for-rhel-9-$(arch)-rpms && \
+    dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm && \
+    dnf -y install portaudio portaudio-devel && \
+    subscription-manager unregister && \
+    dnf -y clean all && \
+    rm -rf /var/cache/dnf
+USER 1001
