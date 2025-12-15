@@ -5,3 +5,5 @@ scipy
 requests
 faster-whisper
 torch
+streamlit-webrtc
+av
