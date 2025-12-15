@@ -1,3 +1,35 @@
+"""
+Streamlit real-time speech-to-text (STT) demo using faster-whisper.
+
+This app supports multiple audio sources:
+- Server microphone ("Microphone"): captured on the server via `sounddevice` (PortAudio).
+  This only works when the Streamlit server has access to an input audio device.
+- Browser microphone ("Browser Mic (WebSocket)"): captured in the browser via Web Audio and
+  streamed to the server over a plain WebSocket as int16 mono PCM frames.
+- WAV test/simulation: transcribe a WAV file in one-shot or simulate streaming from a WAV.
+
+Why WebSocket browser mic?
+WebRTC can be tricky in deployed environments (ICE/STUN/TURN). A simple WebSocket stream is
+often easier to deploy as long as you can expose/proxy the WebSocket endpoint.
+
+WebSocket protocol (browser -> server)
+- Connect to: ws://<host>:<BROWSER_MIC_WS_PORT>/ws?token=<token>
+- After connect, browser sends: {"type":"hello","token":"...","sample_rate": <AudioContext.sampleRate>}
+- Then the browser sends binary frames: little-endian int16 mono PCM at `sample_rate`.
+
+Deployment notes
+- By default the WS server listens on 0.0.0.0:8765. Many platforms only expose one port.
+  In that case you must proxy `/ws` to this WS server, or expose the WS port directly.
+- You can override the browser WS URL with `BROWSER_MIC_WS_URL`. It supports `{token}`
+  substitution, e.g.:
+    export BROWSER_MIC_WS_URL="wss://your.domain/ws?token={token}"
+
+Environment variables
+- BROWSER_MIC_WS_HOST: host to bind the WS server (default "0.0.0.0")
+- BROWSER_MIC_WS_PORT: port to bind the WS server (default "8765")
+- BROWSER_MIC_WS_URL: override WS URL used by the browser (optional; useful behind proxies)
+"""
+
 import streamlit as st
 import torch
 import numpy as np
@@ -8,18 +40,20 @@ import threading
 import time
 from pathlib import Path
 import io
+import os
+import json
+import asyncio
+import secrets
+from urllib.parse import urlparse, parse_qs
+
+import streamlit.components.v1 as components
+
+import websockets
 
 try:
     import sounddevice as sd  # type: ignore
 except Exception:  # pragma: no cover
     sd = None  # allows running in browser-only/container deployments without PortAudio
-
-try:
-    from streamlit_webrtc import AudioProcessorBase, WebRtcMode, webrtc_streamer  # type: ignore
-except Exception:  # pragma: no cover
-    AudioProcessorBase = None  # type: ignore
-    WebRtcMode = None  # type: ignore
-    webrtc_streamer = None  # type: ignore
 
 # Audio configuration
 SAMPLE_RATE = 16000
@@ -31,14 +65,29 @@ DTYPE = "int16"
 CHUNK_DURATION = 5
 BLOCK_SIZE = SAMPLE_RATE * CHUNK_DURATION
 
-# WebRTC browser mic should feel responsive; keep its chunk smaller without affecting other modes.
-BROWSER_MIC_CHUNK_DURATION = 0.75
+# Browser mic via WebSocket should feel responsive; keep its chunk smaller without affecting other modes.
+BROWSER_WS_CHUNK_DURATION = 1.5
+# Browser WebSocket post-filtering to reduce hallucinations on noise.
+# These thresholds only apply when rt_state.source == "browser_ws".
+# - BROWSER_WS_MIN_SEGMENT_DURATION_S:
+#   Drop very short segments. Short "blips" are often noise or partial phonemes that Whisper can
+#   turn into random words (hallucinations).
+# - BROWSER_WS_MAX_NO_SPEECH_PROB:
+#   Whisper outputs `no_speech_prob` per segment. If it's high, the model thinks it was probably
+#   silence/noise; dropping those reduces hallucinations.
+# - BROWSER_WS_MIN_AVG_LOGPROB:
+#   Whisper outputs `avg_logprob` (average token log-probability). More negative means less confident.
+#   Dropping low-confidence segments reduces garbage in the transcript.
+BROWSER_WS_MIN_SEGMENT_DURATION_S = 0.10
+BROWSER_WS_MAX_NO_SPEECH_PROB = 0.80
+BROWSER_WS_MIN_AVG_LOGPROB = -0.80
+# Extra browser_ws-only repetition suppression (common hallucination pattern: "Okay." repeated)
+BROWSER_WS_MAX_REPEAT_SAME_TEXT = 2  # allow up to N consecutive identical segments
 
-# Browser-mic post-filtering to reduce hallucinations on noise.
-# These thresholds only apply when rt_state.source == "browser_mic".
-BROWSER_MIC_MIN_SEGMENT_DURATION_S = 0.10
-BROWSER_MIC_MAX_NO_SPEECH_PROB = 0.95
-BROWSER_MIC_MIN_AVG_LOGPROB = -1.20
+_WS_TOKEN_LOCK = threading.Lock()
+_WS_TOKEN_TO_CTX: dict[str, tuple["RealTimeState", WhisperModel]] = {}
+_WS_SERVER_STARTED = False
+_WS_SERVER_LOCK = threading.Lock()
 
 
 def resample_to_sample_rate(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
@@ -87,15 +136,11 @@ class RealTimeState:
         self.mic_device_index: int | None = None
         self.mic_device_name: str | None = None
         self.capture_sample_rate: int | None = None  # actual input stream sample rate (mic)
-        # Minimal WebRTC debug (does not affect other modes)
-        self.browser_mic_enqueued_bytes: int = 0
-        self.browser_mic_enqueued_frames: int = 0
-        self.browser_mic_last_pcm_shape: str | None = None
-        self.browser_mic_last_pcm_dtype: str | None = None
-        self.browser_mic_last_in_sr: int | None = None
-        self.browser_mic_last_channels_meta: int | None = None
-        self.browser_mic_last_mono_samples: int | None = None
-        self.browser_mic_last_max_abs: float | None = None
+        # Browser mic via WebSocket stats (optional)
+        self.browser_ws_connected: bool = False
+        self.browser_ws_sample_rate: int | None = None
+        self.browser_ws_frames: int = 0
+        self.browser_ws_bytes: int = 0
 
 
 def list_input_devices():
@@ -203,13 +248,15 @@ def transcriber_worker(rt_state: RealTimeState, model: WhisperModel) -> None:
     """Background worker that consumes audio chunks and performs transcription."""
 
     full_audio_buffer = b""
+    last_text_norm: str | None = None
+    last_text_repeat: int = 0
 
     print("Transcriber started. Listening for audio chunks...")
 
     # Mic capture may not be 16k; we resample to SAMPLE_RATE for Whisper.
     capture_sr = int(rt_state.capture_sample_rate or SAMPLE_RATE)
     bytes_per_sample = np.dtype(DTYPE).itemsize
-    chunk_duration = BROWSER_MIC_CHUNK_DURATION if rt_state.source == "browser_mic" else CHUNK_DURATION
+    chunk_duration = BROWSER_WS_CHUNK_DURATION if rt_state.source == "browser_ws" else CHUNK_DURATION
     target_bytes = int(capture_sr * chunk_duration) * bytes_per_sample * CHANNELS
 
     # Keep going while running, and drain any already-queued audio after stop.
@@ -229,10 +276,10 @@ def transcriber_worker(rt_state: RealTimeState, model: WhisperModel) -> None:
                 if capture_sr != SAMPLE_RATE:
                     audio_np = resample_to_sample_rate(audio_np, capture_sr, SAMPLE_RATE).astype(np.float32)
 
-                # Transcribe the chunk using the local Whisper model
+                # Transcribe the chunk using the local Whisper model.
                 transcribe_kwargs = {"beam_size": 5}
-                # Keep browser-mic conservative to reduce hallucinations, without impacting other modes.
-                if rt_state.source == "browser_mic":
+                # Browser WS mic: be conservative to avoid hallucinations, without impacting other modes.
+                if rt_state.source == "browser_ws":
                     transcribe_kwargs.update(
                         {
                             "language": "en",
@@ -241,14 +288,15 @@ def transcriber_worker(rt_state: RealTimeState, model: WhisperModel) -> None:
                             "best_of": 1,
                             "temperature": 0.0,
                             "condition_on_previous_text": False,
+                            "repetition_penalty": 1.2,
+                            "no_repeat_ngram_size": 3,
                             "vad_filter": True,
                             "vad_parameters": {
-                                "min_silence_duration_ms": 200,
-                                "speech_pad_ms": 100,
+                                "min_silence_duration_ms": 400,
+                                "speech_pad_ms": 200,
                             },
-                            # Slightly more permissive so quiet/short speech isn't dropped.
-                            "no_speech_threshold": 0.6,
-                            "log_prob_threshold": -1.0,
+                            "no_speech_threshold": 0.8,
+                            "log_prob_threshold": -0.8,
                             "compression_ratio_threshold": 2.2,
                             "hallucination_silence_threshold": 0.5,
                         }
@@ -259,17 +307,29 @@ def transcriber_worker(rt_state: RealTimeState, model: WhisperModel) -> None:
                 # Append the recognized text to the shared transcript
                 chunk_text = ""
                 for segment in segments:
-                    # Browser-mic-only: drop low-confidence / likely-no-speech segments.
-                    if rt_state.source == "browser_mic":
+                    # Browser WS mic: drop low-confidence / likely-no-speech segments.
+                    if rt_state.source == "browser_ws":
                         seg_dur = float(segment.end - segment.start)
-                        if seg_dur < BROWSER_MIC_MIN_SEGMENT_DURATION_S:
+                        if seg_dur < BROWSER_WS_MIN_SEGMENT_DURATION_S:
                             continue
-                        if float(segment.no_speech_prob) > BROWSER_MIC_MAX_NO_SPEECH_PROB:
+                        if float(segment.no_speech_prob) > BROWSER_WS_MAX_NO_SPEECH_PROB:
                             continue
-                        if float(segment.avg_logprob) < BROWSER_MIC_MIN_AVG_LOGPROB:
+                        if float(segment.avg_logprob) < BROWSER_WS_MIN_AVG_LOGPROB:
                             continue
 
-                    line = f"{segment.text.strip()} "
+                    txt = segment.text.strip()
+                    if rt_state.source == "browser_ws":
+                        # Drop excessive repeats of identical text (e.g. "Okay." over and over).
+                        norm = " ".join(txt.lower().split())
+                        if norm and norm == last_text_norm:
+                            last_text_repeat += 1
+                            if last_text_repeat > BROWSER_WS_MAX_REPEAT_SAME_TEXT:
+                                continue
+                        else:
+                            last_text_norm = norm
+                            last_text_repeat = 0
+
+                    line = f"{txt} "
                     print(f"[ {segment.start:.2f}s -> {segment.end:.2f}s ] {segment.text}")
                     chunk_text += line
                     rt_state.segment_count += 1
@@ -331,8 +391,8 @@ def start_realtime_transcription(rt_state: RealTimeState, model: WhisperModel, d
     rt_state.transcriber_thread.start()
 
 
-def start_browser_mic_transcription(rt_state: RealTimeState, model: WhisperModel) -> None:
-    """Start transcription for browser mic (audio is fed via streamlit-webrtc)."""
+def start_browser_ws_transcription(rt_state: RealTimeState, model: WhisperModel, capture_sr: int) -> None:
+    """Start transcription for browser mic (audio is fed via a WebSocket)."""
     if rt_state.running_event.is_set():
         return
 
@@ -341,16 +401,10 @@ def start_browser_mic_transcription(rt_state: RealTimeState, model: WhisperModel
     rt_state.segment_count = 0
     rt_state.last_update_ts = None
     rt_state.last_error = None
-    rt_state.source = "browser_mic"
-    rt_state.capture_sample_rate = SAMPLE_RATE
-    rt_state.browser_mic_enqueued_bytes = 0
-    rt_state.browser_mic_enqueued_frames = 0
-    rt_state.browser_mic_last_pcm_shape = None
-    rt_state.browser_mic_last_pcm_dtype = None
-    rt_state.browser_mic_last_in_sr = None
-    rt_state.browser_mic_last_channels_meta = None
-    rt_state.browser_mic_last_mono_samples = None
-    rt_state.browser_mic_last_max_abs = None
+    rt_state.source = "browser_ws"
+    rt_state.capture_sample_rate = int(capture_sr)
+    rt_state.browser_ws_frames = 0
+    rt_state.browser_ws_bytes = 0
 
     while not rt_state.audio_queue.empty():
         try:
@@ -467,6 +521,115 @@ def stop_realtime_transcription(rt_state: RealTimeState) -> None:
         rt_state.transcriber_thread.join(timeout=5.0)
 
 
+async def _ws_handler(websocket, path=None):
+    """Handle one browser WS client connection.
+
+    Expected client behavior:
+    - token may be passed via query param `?token=...`
+    - client should send a hello JSON message with sample_rate (AudioContext sample rate)
+    - client then sends binary audio frames as int16 mono PCM
+    """
+    rt_state: RealTimeState | None = None
+    model: WhisperModel | None = None
+    token: str | None = None
+    capture_sr: int = 48000
+
+    try:
+        # token can be passed as query param: ws://host:port/ws?token=...
+        try:
+            # websockets<11 passes `path` arg; websockets>=11 attaches it to the connection
+            req_path = path or getattr(websocket, "path", None) or getattr(getattr(websocket, "request", None), "path", "")
+            parsed = urlparse(req_path)
+            qs = parse_qs(parsed.query or "")
+            token = (qs.get("token", [None])[0]) if qs else None
+        except Exception:
+            token = None
+
+        if token:
+            with _WS_TOKEN_LOCK:
+                ctx = _WS_TOKEN_TO_CTX.get(token)
+                if ctx:
+                    rt_state, model = ctx
+
+        if rt_state is None:
+            # Wait for a hello message with token
+            msg = await websocket.recv()
+            if isinstance(msg, (bytes, bytearray)):
+                await websocket.close(code=1008, reason="Expected hello JSON first")
+                return
+            try:
+                hello = json.loads(msg)
+            except Exception:
+                await websocket.close(code=1008, reason="Invalid hello JSON")
+                return
+            token = str(hello.get("token", "")).strip() or None
+            capture_sr = int(hello.get("sample_rate", capture_sr) or capture_sr)
+            if token:
+                with _WS_TOKEN_LOCK:
+                    ctx = _WS_TOKEN_TO_CTX.get(token)
+                    if ctx:
+                        rt_state, model = ctx
+
+        if rt_state is None:
+            await websocket.close(code=1008, reason="Unknown token")
+            return
+
+        rt_state.browser_ws_connected = True
+        rt_state.browser_ws_sample_rate = capture_sr
+
+        # Start transcriber when the first client connects (needs model registered for this token)
+        if model is not None:
+            if not rt_state.running_event.is_set() or rt_state.source != "browser_ws":
+                start_browser_ws_transcription(rt_state, model, capture_sr=capture_sr)
+
+        async for msg in websocket:
+            if isinstance(msg, str):
+                # Optional control messages
+                try:
+                    ctrl = json.loads(msg)
+                except Exception:
+                    continue
+                if ctrl.get("type") == "hello":
+                    capture_sr = int(ctrl.get("sample_rate", capture_sr) or capture_sr)
+                    rt_state.browser_ws_sample_rate = capture_sr
+                continue
+
+            # Binary audio chunk
+            if rt_state.running_event.is_set() and rt_state.source == "browser_ws":
+                rt_state.audio_queue.put(bytes(msg))
+                rt_state.browser_ws_frames += 1
+                rt_state.browser_ws_bytes += len(msg)
+
+    finally:
+        if rt_state is not None:
+            rt_state.browser_ws_connected = False
+            # stop only if this session is in browser_ws mode
+            if rt_state.running_event.is_set() and rt_state.source == "browser_ws":
+                stop_realtime_transcription(rt_state)
+
+
+def ensure_browser_ws_server() -> int:
+    """Start the browser mic WebSocket server once per process; returns port."""
+    global _WS_SERVER_STARTED
+    with _WS_SERVER_LOCK:
+        if _WS_SERVER_STARTED:
+            return int(os.getenv("BROWSER_MIC_WS_PORT", "8765"))
+
+        port = int(os.getenv("BROWSER_MIC_WS_PORT", "8765"))
+        host = os.getenv("BROWSER_MIC_WS_HOST", "0.0.0.0")
+
+        def _run():
+            async def _main():
+                async with websockets.serve(_ws_handler, host, port, max_size=2**22):
+                    await asyncio.Future()  # run forever
+
+            asyncio.run(_main())
+
+        t = threading.Thread(target=_run, daemon=True, name="browser_mic_ws_server")
+        t.start()
+        _WS_SERVER_STARTED = True
+        return port
+
 def _decode_wav_bytes_to_mono_float32_16k(wav_bytes: bytes) -> np.ndarray:
     """
     Decode WAV bytes -> mono float32 array in [-1, 1] at SAMPLE_RATE.
@@ -504,111 +667,180 @@ def main():
         "in real-time using a local Whisper model."
     )
 
-    def _browser_webrtc_panel():
-        st.subheader("Browser Mic (WebRTC - simple)")
+    def _browser_ws_panel():
+        st.subheader("Browser Mic (WebSocket)")
 
-        if webrtc_streamer is None or AudioProcessorBase is None or WebRtcMode is None:
-            st.info("Install `streamlit-webrtc` to enable browser mic streaming.")
-            return
+        port = ensure_browser_ws_server()
+        if "browser_ws_token" not in st.session_state:
+            st.session_state.browser_ws_token = secrets.token_urlsafe(16)
+        token = st.session_state.browser_ws_token
 
-        def _coerce_int(v, default: int) -> int:
-            if v is None:
-                return default
-            if isinstance(v, (int, np.integer)):
-                return int(v)
-            if isinstance(v, (tuple, list)):
-                return len(v) if len(v) > 0 else default
-            try:
-                return int(v)
-            except Exception:
-                return default
+        # Register this Streamlit session with the WS server
+        with _WS_TOKEN_LOCK:
+            _WS_TOKEN_TO_CTX[token] = (rt_state, model)
 
-        class _AudioProcessor(AudioProcessorBase):
-            async def recv_queued(self, frames):
-                # Process all frames in async mode (avoids dropped-frame warnings and improves throughput).
-                for f in frames:
-                    self.recv(f)
-                return frames
-
-            def recv(self, frame):
-                # Minimal decoding: to mono -> float32 -> resample to 16k -> int16 bytes -> enqueue
-                try:
-                    pcm = frame.to_ndarray()
-                    rt_state.browser_mic_last_pcm_shape = str(getattr(pcm, "shape", None))
-                    rt_state.browser_mic_last_pcm_dtype = str(getattr(pcm, "dtype", None))
-
-                    channels_meta = 1
-                    try:
-                        channels_meta = _coerce_int(getattr(frame.layout, "channels", None), 1)
-                    except Exception:
-                        channels_meta = 1
-                    rt_state.browser_mic_last_channels_meta = int(channels_meta)
-
-                    # Normalize FIRST (before mixing). Otherwise np.mean(int16) becomes float64 in "PCM counts"
-                    # and Whisper sees near-silence.
-                    if np.issubdtype(pcm.dtype, np.integer):
-                        denom = float(np.iinfo(pcm.dtype).max)
-                        pcm_f = pcm.astype(np.float32) / denom
-                    else:
-                        pcm_f = pcm.astype(np.float32)
-
-                    if pcm_f.ndim == 2:
-                        # Common cases:
-                        # - (channels, samples)
-                        # - (samples, channels)
-                        if pcm_f.shape[0] <= 8 and pcm_f.shape[1] > pcm_f.shape[0]:
-                            # channels-first
-                            if pcm_f.shape[0] == 1 and channels_meta > 1 and (pcm_f.shape[1] % channels_meta) == 0:
-                                interleaved = pcm_f.reshape(-1)
-                                pcm2 = interleaved.reshape(-1, channels_meta)
-                                mono = np.mean(pcm2, axis=1)
-                            else:
-                                mono = np.mean(pcm_f, axis=0)
-                        else:
-                            mono = np.mean(pcm_f, axis=1)
-                    else:
-                        mono = pcm_f.reshape(-1)
-
-                    audio_f = mono.astype(np.float32)
-
-                    in_sr = _coerce_int(getattr(frame, "sample_rate", None), SAMPLE_RATE)
-                    rt_state.browser_mic_last_in_sr = int(in_sr)
-                    if in_sr != SAMPLE_RATE:
-                        audio_f = resample_to_sample_rate(audio_f, in_sr, SAMPLE_RATE).astype(np.float32)
-
-                    # Clamp to sane range (resample can overshoot slightly)
-                    audio_f = np.clip(audio_f, -1.0, 1.0)
-                    rt_state.browser_mic_last_mono_samples = int(audio_f.size)
-                    rt_state.browser_mic_last_max_abs = float(np.max(np.abs(audio_f))) if audio_f.size else 0.0
-
-                    audio_i16 = (np.clip(audio_f, -1.0, 1.0) * 32767.0).astype(np.int16)
-                    b = audio_i16.tobytes()
-                    if b and rt_state.running_event.is_set() and rt_state.source == "browser_mic":
-                        rt_state.audio_queue.put(b)
-                        rt_state.browser_mic_enqueued_frames += 1
-                        rt_state.browser_mic_enqueued_bytes += len(b)
-                except Exception as e:
-                    rt_state.last_error = f"WebRTC audio error: {type(e).__name__}: {e}"
-                return frame
-
-        webrtc_ctx = webrtc_streamer(
-            key="browser_mic_webrtc",
-            mode=WebRtcMode.SENDONLY,
-            audio_processor_factory=_AudioProcessor,
-            async_processing=True,
-            media_stream_constraints={"audio": True, "video": False},
+        st.caption(
+            f"WebSocket server: ws://<this-host>:{port}/ws?token=...  "
+            f"(deployment must expose/proxy this port)"
         )
 
-        if webrtc_ctx.state.playing:
-            if not rt_state.running_event.is_set() or rt_state.source != "browser_mic":
-                start_browser_mic_transcription(rt_state, model)
-                st.success("Browser mic streaming started.")
-        else:
-            if rt_state.running_event.is_set() and rt_state.source == "browser_mic":
-                stop_realtime_transcription(rt_state)
-                st.info("Browser mic streaming stopped.")
+        ws_url_env = os.getenv("BROWSER_MIC_WS_URL", "").strip()
+        ws_url = ws_url_env if ws_url_env else ""  # JS will build from location + port if empty
 
-    _browser_webrtc_panel()
+        html = f"""
+<!doctype html>
+<html>
+  <body>
+    <div style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;">
+      <button id="startBtn">Start Browser Mic</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <span id="status" style="margin-left: 8px;">idle</span>
+    </div>
+    <script>
+      const token = {json.dumps(token)};
+      const wsPort = {port};
+      const wsUrlOverride = {json.dumps(ws_url)};
+
+      function buildWsUrl() {{
+        if (wsUrlOverride) {{
+          // allow {token} substitution
+          return wsUrlOverride.replaceAll("{{token}}", encodeURIComponent(token));
+        }}
+        // We're running inside an iframe (often about:srcdoc), so window.location may not have a hostname.
+        // Prefer parent window location, then referrer.
+        let proto = "";
+        let host = "";
+        try {{
+          proto = window.parent.location.protocol || "";
+          host = window.parent.location.hostname || "";
+        }} catch (e) {{}}
+        if (!host) {{
+          try {{
+            proto = window.location.protocol || proto;
+            host = window.location.hostname || host;
+          }} catch (e) {{}}
+        }}
+        if (!host) {{
+          try {{
+            const u = new URL(document.referrer);
+            proto = u.protocol || proto;
+            host = u.hostname || host;
+          }} catch (e) {{}}
+        }}
+        const scheme = (proto === "https:") ? "wss" : "ws";
+        return `${{scheme}}://${{host}}:${{wsPort}}/ws?token=${{encodeURIComponent(token)}}`;
+      }}
+
+      const statusEl = document.getElementById("status");
+      const startBtn = document.getElementById("startBtn");
+      const stopBtn = document.getElementById("stopBtn");
+
+      let ws = null;
+      let audioCtx = null;
+      let processor = null;
+      let source = null;
+      let stream = null;
+      let zeroGain = null;
+
+      function setStatus(s) {{
+        statusEl.textContent = s;
+      }}
+
+      function floatTo16BitPCM(float32Array) {{
+        const out = new Int16Array(float32Array.length);
+        for (let i = 0; i < float32Array.length; i++) {{
+          let s = Math.max(-1, Math.min(1, float32Array[i]));
+          out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }}
+        return out;
+      }}
+
+      async function start() {{
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        setStatus("requesting mic...");
+
+        const url = buildWsUrl();
+        ws = new WebSocket(url);
+        ws.binaryType = "arraybuffer";
+
+        ws.onopen = async () => {{
+          setStatus("ws connected, starting audio...");
+          stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          source = audioCtx.createMediaStreamSource(stream);
+
+          // ScriptProcessor is deprecated but simplest for a first pass.
+          const bufSize = 4096;
+          processor = audioCtx.createScriptProcessor(bufSize, source.channelCount, 1);
+          zeroGain = audioCtx.createGain();
+          zeroGain.gain.value = 0;
+
+          processor.onaudioprocess = (e) => {{
+            if (!ws || ws.readyState !== 1) return;
+            const inBuf = e.inputBuffer;
+            const chs = inBuf.numberOfChannels;
+            const frames = inBuf.length;
+            const mono = new Float32Array(frames);
+            for (let ch = 0; ch < chs; ch++) {{
+              const data = inBuf.getChannelData(ch);
+              for (let i = 0; i < frames; i++) mono[i] += data[i] / chs;
+            }}
+            const pcm16 = floatTo16BitPCM(mono);
+            ws.send(pcm16.buffer);
+          }};
+
+          source.connect(processor);
+          processor.connect(zeroGain);
+          zeroGain.connect(audioCtx.destination);
+
+          // Send hello so server can know the sample rate
+          ws.send(JSON.stringify({{type: "hello", token, sample_rate: audioCtx.sampleRate}}));
+          setStatus("streaming...");
+        }};
+
+        ws.onclose = () => {{
+          setStatus("ws closed");
+          startBtn.disabled = false;
+          stopBtn.disabled = true;
+        }};
+
+        ws.onerror = (e) => {{
+          setStatus("ws error");
+        }};
+      }}
+
+      async function stop() {{
+        stopBtn.disabled = true;
+        startBtn.disabled = false;
+        setStatus("stopping...");
+
+        try {{
+          if (processor) processor.disconnect();
+          if (source) source.disconnect();
+          if (zeroGain) zeroGain.disconnect();
+          if (stream) stream.getTracks().forEach(t => t.stop());
+          if (audioCtx) await audioCtx.close();
+        }} catch (e) {{}}
+
+        processor = null; source = null; zeroGain = null; stream = null; audioCtx = null;
+
+        try {{
+          if (ws) ws.close();
+        }} catch (e) {{}}
+        ws = null;
+        setStatus("idle");
+      }}
+
+      startBtn.addEventListener("click", start);
+      stopBtn.addEventListener("click", stop);
+    </script>
+  </body>
+</html>
+"""
+        components.html(html, height=80)
+
+    _browser_ws_panel()
 
     @st.fragment(run_every=0.5)
     def _controls_panel():
@@ -767,14 +999,10 @@ def main():
             f"queue={rt_state.audio_queue.qsize()}  "
             f"segments={rt_state.segment_count}  "
             f"last_update={'-' if rt_state.last_update_ts is None else f'{time.time() - rt_state.last_update_ts:.1f}s ago'}  "
-            f"webrtc_frames={rt_state.browser_mic_enqueued_frames if rt_state.source == 'browser_mic' else '-'}  "
-            f"webrtc_kb={rt_state.browser_mic_enqueued_bytes // 1024 if rt_state.source == 'browser_mic' else '-'}  "
-            f"pcm_shape={(rt_state.browser_mic_last_pcm_shape or '-') if rt_state.source == 'browser_mic' else '-'}  "
-            f"dtype={(rt_state.browser_mic_last_pcm_dtype or '-') if rt_state.source == 'browser_mic' else '-'}  "
-            f"in_sr={(rt_state.browser_mic_last_in_sr or '-') if rt_state.source == 'browser_mic' else '-'}  "
-            f"ch_meta={(rt_state.browser_mic_last_channels_meta or '-') if rt_state.source == 'browser_mic' else '-'}  "
-            f"samples={(rt_state.browser_mic_last_mono_samples or '-') if rt_state.source == 'browser_mic' else '-'}  "
-            f"max={(f'{rt_state.browser_mic_last_max_abs:.3f}' if rt_state.browser_mic_last_max_abs is not None else '-') if rt_state.source == 'browser_mic' else '-'}  "
+            f"ws_connected={rt_state.browser_ws_connected if rt_state.source == 'browser_ws' else '-'}  "
+            f"ws_sr={rt_state.browser_ws_sample_rate if rt_state.source == 'browser_ws' else '-'}  "
+            f"ws_frames={rt_state.browser_ws_frames if rt_state.source == 'browser_ws' else '-'}  "
+            f"ws_kb={rt_state.browser_ws_bytes // 1024 if rt_state.source == 'browser_ws' else '-'}  "
             f"err={rt_state.last_error or '-'}"
         )
 
