@@ -770,29 +770,68 @@ def main():
           audioCtx = new (window.AudioContext || window.webkitAudioContext)();
           source = audioCtx.createMediaStreamSource(stream);
 
-          // ScriptProcessor is deprecated but simplest for a first pass.
-          const bufSize = 4096;
-          processor = audioCtx.createScriptProcessor(bufSize, source.channelCount, 1);
           zeroGain = audioCtx.createGain();
           zeroGain.gain.value = 0;
 
-          processor.onaudioprocess = (e) => {{
-            if (!ws || ws.readyState !== 1) return;
-            const inBuf = e.inputBuffer;
-            const chs = inBuf.numberOfChannels;
-            const frames = inBuf.length;
-            const mono = new Float32Array(frames);
-            for (let ch = 0; ch < chs; ch++) {{
-              const data = inBuf.getChannelData(ch);
-              for (let i = 0; i < frames; i++) mono[i] += data[i] / chs;
-            }}
-            const pcm16 = floatTo16BitPCM(mono);
-            ws.send(pcm16.buffer);
-          }};
+          // Prefer AudioWorklet (modern API). Fall back to ScriptProcessor for older browsers.
+          if (audioCtx.audioWorklet && window.AudioWorkletNode) {{
+            setStatus("loading audio worklet...");
+            const workletCode = `
+              class MonoPCMProcessor extends AudioWorkletProcessor {{
+                process(inputs, outputs, parameters) {{
+                  const input = inputs[0];
+                  if (!input || input.length === 0) return true;
+                  const chs = input.length;
+                  const frames = input[0].length;
+                  const mono = new Float32Array(frames);
+                  for (let ch = 0; ch < chs; ch++) {{
+                    const data = input[ch];
+                    for (let i = 0; i < frames; i++) mono[i] += data[i] / chs;
+                  }}
+                  this.port.postMessage(mono, [mono.buffer]);
+                  return true;
+                }}
+              }}
+              registerProcessor('mono-pcm', MonoPCMProcessor);
+            `;
+            const blob = new Blob([workletCode], {{ type: "application/javascript" }});
+            const workletUrl = URL.createObjectURL(blob);
+            await audioCtx.audioWorklet.addModule(workletUrl);
+            URL.revokeObjectURL(workletUrl);
 
-          source.connect(processor);
-          processor.connect(zeroGain);
-          zeroGain.connect(audioCtx.destination);
+            processor = new AudioWorkletNode(audioCtx, "mono-pcm");
+            processor.port.onmessage = (ev) => {{
+              if (!ws || ws.readyState !== 1) return;
+              const mono = new Float32Array(ev.data);
+              const pcm16 = floatTo16BitPCM(mono);
+              ws.send(pcm16.buffer);
+            }};
+
+            source.connect(processor);
+            processor.connect(zeroGain);
+            zeroGain.connect(audioCtx.destination);
+          }} else {{
+            // ScriptProcessor is deprecated but still widely supported and simple.
+            const bufSize = 4096;
+            processor = audioCtx.createScriptProcessor(bufSize, source.channelCount, 1);
+            processor.onaudioprocess = (e) => {{
+              if (!ws || ws.readyState !== 1) return;
+              const inBuf = e.inputBuffer;
+              const chs = inBuf.numberOfChannels;
+              const frames = inBuf.length;
+              const mono = new Float32Array(frames);
+              for (let ch = 0; ch < chs; ch++) {{
+                const data = inBuf.getChannelData(ch);
+                for (let i = 0; i < frames; i++) mono[i] += data[i] / chs;
+              }}
+              const pcm16 = floatTo16BitPCM(mono);
+              ws.send(pcm16.buffer);
+            }};
+
+            source.connect(processor);
+            processor.connect(zeroGain);
+            zeroGain.connect(audioCtx.destination);
+          }}
 
           // Send hello so server can know the sample rate
           ws.send(JSON.stringify({{type: "hello", token, sample_rate: audioCtx.sampleRate}}));
