@@ -1,0 +1,6 @@
+numpy
+scipy
+torch==2.9.0
+torchaudio==2.9.0
+torchcodec
+packaging
