@@ -8,6 +8,8 @@ import threading
 import time
 from pathlib import Path
 import io
+import os
+import json
 
 try:
     import sounddevice as sd  # type: ignore
@@ -15,11 +17,12 @@ except Exception:  # pragma: no cover
     sd = None  # allows running in browser-only/container deployments without PortAudio
 
 try:
-    from streamlit_webrtc import AudioProcessorBase, WebRtcMode, webrtc_streamer  # type: ignore
+    from streamlit_webrtc import AudioProcessorBase, WebRtcMode, webrtc_streamer, RTCConfiguration  # type: ignore
 except Exception:  # pragma: no cover
     AudioProcessorBase = None  # type: ignore
     WebRtcMode = None  # type: ignore
     webrtc_streamer = None  # type: ignore
+    RTCConfiguration = None  # type: ignore
 
 # Audio configuration
 SAMPLE_RATE = 16000
@@ -507,9 +510,38 @@ def main():
     def _browser_webrtc_panel():
         st.subheader("Browser Mic (WebRTC - simple)")
 
-        if webrtc_streamer is None or AudioProcessorBase is None or WebRtcMode is None:
+        if webrtc_streamer is None or AudioProcessorBase is None or WebRtcMode is None or RTCConfiguration is None:
             st.info("Install `streamlit-webrtc` to enable browser mic streaming.")
             return
+
+        # Deployed environments often need explicit STUN/TURN.
+        # - Default: Google public STUN (works in many cases)
+        # - Optional: provide TURN via env var WEBRTC_ICE_SERVERS (JSON) or WEBRTC_TURN_URL/USER/PASS
+        #
+        # WEBRTC_ICE_SERVERS example:
+        #   export WEBRTC_ICE_SERVERS='[{"urls":["stun:stun.l.google.com:19302"]},{"urls":["turn:turn.example.com:3478"],"username":"u","credential":"p"}]'
+        ice_servers = None
+        ice_servers_json = os.getenv("WEBRTC_ICE_SERVERS")
+        if ice_servers_json:
+            try:
+                ice_servers = json.loads(ice_servers_json)
+            except Exception as e:
+                st.warning(f"Invalid WEBRTC_ICE_SERVERS JSON: {type(e).__name__}: {e}")
+                ice_servers = None
+
+        if ice_servers is None:
+            turn_url = os.getenv("WEBRTC_TURN_URL")
+            turn_user = os.getenv("WEBRTC_TURN_USERNAME")
+            turn_pass = os.getenv("WEBRTC_TURN_PASSWORD")
+            if turn_url and turn_user and turn_pass:
+                ice_servers = [
+                    {"urls": ["stun:stun.l.google.com:19302"]},
+                    {"urls": [turn_url], "username": turn_user, "credential": turn_pass},
+                ]
+            else:
+                ice_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+
+        rtc_config = RTCConfiguration(iceServers=ice_servers)
 
         def _coerce_int(v, default: int) -> int:
             if v is None:
@@ -594,6 +626,7 @@ def main():
         webrtc_ctx = webrtc_streamer(
             key="browser_mic_webrtc",
             mode=WebRtcMode.SENDONLY,
+            rtc_configuration=rtc_config,
             audio_processor_factory=_AudioProcessor,
             async_processing=True,
             media_stream_constraints={"audio": True, "video": False},
