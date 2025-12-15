@@ -1,16 +1,27 @@
 from boson_multimodal.serve.serve_engine import HiggsAudioServeEngine, HiggsAudioResponse
-from boson_multimodal.data_types import ChatMLSample, Message, AudioContent
+from boson_multimodal.data_types import ChatMLSample, Message, AudioContent, TextContent
 
 import torch
 import torchaudio
 import time
 import click
 
-MODEL_PATH = "ataraksea/higgs-audio-v2-W4A16-G128" # "bosonai/higgs-audio-v2-generation-3B-base"
+MODEL_PATH = "bosonai/higgs-audio-v2-generation-3B-base" # "ataraksea/higgs-audio-v2-W4A16-G128" # 
 AUDIO_TOKENIZER_PATH = "bosonai/higgs-audio-v2-tokenizer"
+
+# Define the messages to send to the model for generation
+# Simplified "prompt" structure (ChatML-like messages)
+# This is conceptually what generation.py builds before generation.
 
 system_prompt = (
     "Generate audio following instruction.\n\n<|scene_desc_start|>\nAudio is recorded from a quiet room.\n<|scene_desc_end|>"
+)
+belinda_prompt_text = "Twas the night before my birthday. Hooray! It's almost here! It may not be a holiday, but it's the best day of the year."  # from examples/voice_prompts/belinda.txt
+belinda_prompt_wav = "belinda.wav"  # from examples/voice_prompts/belinda.wav
+
+transcript = (
+    "The sun rises in the east and sets in the west. "
+    "This simple fact has been observed by humans for thousands of years."
 )
 
 messages = [
@@ -18,9 +29,19 @@ messages = [
         role="system",
         content=system_prompt,
     ),
+    # Voice prompt
     Message(
         role="user",
-        content="The sun rises in the east and sets in the west. This simple fact has been observed by humans for thousands of years.",
+        content=belinda_prompt_text,
+    ),
+    Message(
+        role="assistant",
+        content=AudioContent(audio_url=belinda_prompt_wav),
+    ),
+    # Your actual request
+    Message(
+        role="user",
+        content=transcript,
     ),
 ]
 
